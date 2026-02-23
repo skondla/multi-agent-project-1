@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "customer-intelligence-platform"
+version = "0.1.0"
+description = "Multi-Agent AI Application with MCP for Customer Intelligence"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+keywords = ["ai", "agents", "mcp", "crm", "machine-learning", "anthropic"]
+
+dependencies = [
+    "anthropic>=0.40.0",
+    "mcp>=1.2.0",
+    "fastmcp>=2.0.0",
+    "numpy>=1.26.0",
+    "scikit-learn>=1.4.0",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+cip = "main:main_sync"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_server*", "mcp_client*", "agents*", "orchestrator*", "ui*"]

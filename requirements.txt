@@ -1,0 +1,23 @@
+# ─── Anthropic SDK ───────────────────────────────────────────────────────────
+anthropic>=0.40.0
+
+# ─── MCP Protocol ────────────────────────────────────────────────────────────
+# MCP core library (provides ClientSession, StdioServerParameters, etc.)
+mcp>=1.2.0
+
+# FastMCP server framework (simpler @mcp.tool decorator API)
+fastmcp>=2.0.0
+
+# ─── ML / Data Science ───────────────────────────────────────────────────────
+numpy>=1.26.0
+scikit-learn>=1.4.0
+
+# ─── Terminal UI ─────────────────────────────────────────────────────────────
+rich>=13.7.0
+
+# ─── Utilities ───────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ─── Development / Testing ───────────────────────────────────────────────────
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
