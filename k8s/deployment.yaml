@@ -1,0 +1,162 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Customer Intelligence Platform — Kubernetes Deployment
+#
+# Image tag substitution: the CD workflow uses envsubst to replace ${IMAGE_URI}
+# with the actual ECR image URI before applying this manifest.
+#
+# Deploy command (used by cd-eks.yml):
+#   export IMAGE_URI=<account>.dkr.ecr.<region>.amazonaws.com/<repo>:<sha>
+#   envsubst '$IMAGE_URI' < k8s/deployment.yaml | kubectl apply -f -
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: customer-intelligence
+  namespace: customer-intelligence
+  labels:
+    app.kubernetes.io/name: customer-intelligence-platform
+    app.kubernetes.io/component: api
+    app.kubernetes.io/version: "latest"
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: customer-intelligence-platform
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Zero-downtime: new pod must be ready before old one terminates
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app: customer-intelligence-platform
+        app.kubernetes.io/name: customer-intelligence-platform
+        app.kubernetes.io/component: api
+      annotations:
+        # Force pod restart on configmap/secret changes
+        kubectl.kubernetes.io/restartedAt: "placeholder"
+
+    spec:
+      # ─── Security Context ──────────────────────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      # ─── Graceful Termination ─────────────────────────────────────────────
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: api
+          # IMAGE_URI is substituted by the CD pipeline via envsubst
+          image: ${IMAGE_URI}
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          # ─── Environment ─────────────────────────────────────────────────
+          envFrom:
+            - configMapRef:
+                name: customer-intelligence-config
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: customer-intelligence-secrets
+                  key: ANTHROPIC_API_KEY
+            # Pod identity metadata (useful for logging/tracing)
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+
+          # ─── Resources ───────────────────────────────────────────────────
+          resources:
+            requests:
+              # Minimal: API calls to Claude + MCP subprocess
+              cpu: "250m"
+              memory: "384Mi"
+            limits:
+              # Headroom for sklearn (clustering) + numpy operations
+              cpu: "1000m"
+              memory: "1Gi"
+
+          # ─── Liveness Probe ───────────────────────────────────────────────
+          # Restarts pod if it becomes unresponsive
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30   # Allow time for MCP subprocess startup
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # ─── Readiness Probe ──────────────────────────────────────────────
+          # Removes pod from service LB until MCP server is connected
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # ─── Startup Probe ────────────────────────────────────────────────
+          # Extra time allowance during initial MCP server boot
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 12    # 12 × 5s = 60s maximum startup time
+
+          # ─── Container Security ───────────────────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # Needs write for MCP subprocess pipes
+            capabilities:
+              drop:
+                - ALL
+
+      # ─── Spread across AZs ────────────────────────────────────────────────
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: customer-intelligence-platform
+
+      # ─── Anti-affinity (spread replicas across nodes) ─────────────────────
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - customer-intelligence-platform
+                topologyKey: kubernetes.io/hostname

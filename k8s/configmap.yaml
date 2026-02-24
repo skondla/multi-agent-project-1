@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: customer-intelligence-config
+  namespace: customer-intelligence
+  labels:
+    app.kubernetes.io/name: customer-intelligence-platform
+    app.kubernetes.io/component: config
+data:
+  # Application settings
+  LOG_LEVEL: "WARNING"
+  PORT: "8000"
+  CLAUDE_MODEL: "claude-sonnet-4-6"
+  PYTHONUNBUFFERED: "1"
+
+  # CORS: comma-separated list of allowed origins
+  # Set to specific domains in production (never use * in prod with credentials)
+  CORS_ORIGINS: "*"

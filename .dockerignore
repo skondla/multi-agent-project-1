@@ -1,0 +1,59 @@
+# ─── Python artifacts ────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Environment / secrets ───────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Version control ─────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ─── CI/CD ───────────────────────────────────────────────────────────────────
+.github/
+
+# ─── Development tools ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ─── Testing artifacts ───────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ─── Documentation ───────────────────────────────────────────────────────────
+docs/
+*.md
+!README.md
+
+# ─── Kubernetes / Terraform (not needed in image) ────────────────────────────
+k8s/
+terraform/
+*.tf
+*.tfvars
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/

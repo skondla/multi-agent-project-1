@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Kubernetes Ingress — AWS Application Load Balancer (ALB)
+#
+# Prerequisites:
+#   1. AWS Load Balancer Controller installed in EKS cluster:
+#      https://kubernetes-sigs.github.io/aws-load-balancer-controller/
+#      helm repo add eks https://aws.github.io/eks-charts
+#      helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#        -n kube-system --set clusterName=<cluster-name>
+#
+#   2. Subnets tagged for the ALB controller:
+#      Public subnets:  kubernetes.io/role/elb = 1
+#      Private subnets: kubernetes.io/role/internal-elb = 1
+#
+# Customization:
+#   - Replace <your-cert-arn> with your ACM certificate ARN for HTTPS
+#   - Replace <your-domain.com> with your actual domain
+#   - Set alb.ingress.kubernetes.io/group.name for shared ALB (cost savings)
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: customer-intelligence-ingress
+  namespace: customer-intelligence
+  labels:
+    app.kubernetes.io/name: customer-intelligence-platform
+    app.kubernetes.io/component: ingress
+  annotations:
+    # ─── ALB Controller annotations ─────────────────────────────────────────
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing      # or "internal"
+    alb.ingress.kubernetes.io/target-type: ip              # IP mode (EKS-native)
+    alb.ingress.kubernetes.io/load-balancer-name: customer-intelligence-alb
+
+    # ─── HTTPS / TLS ─────────────────────────────────────────────────────────
+    # Uncomment and set your ACM certificate ARN for HTTPS:
+    # alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    # alb.ingress.kubernetes.io/ssl-redirect: '443'
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:<region>:<account>:certificate/<id>
+
+    # ─── Health check ─────────────────────────────────────────────────────────
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "10"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+    # ─── ALB attributes ───────────────────────────────────────────────────────
+    alb.ingress.kubernetes.io/load-balancer-attributes: >-
+      idle_timeout.timeout_seconds=120,
+      routing.http.drop_invalid_header_fields.enabled=true
+
+    # ─── Security (WAF) ───────────────────────────────────────────────────────
+    # Uncomment to attach AWS WAF WebACL:
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:<region>:<account>:regional/webacl/<name>/<id>
+
+    # ─── Tags ─────────────────────────────────────────────────────────────────
+    alb.ingress.kubernetes.io/tags: >-
+      Project=CustomerIntelligence,
+      Environment=Production,
+      ManagedBy=GitHubActions
+
+spec:
+  rules:
+    # Replace with your actual domain (or use '*' wildcard during testing)
+    - host: "api.customer-intelligence.example.com"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: customer-intelligence-svc
+                port:
+                  number: 80
