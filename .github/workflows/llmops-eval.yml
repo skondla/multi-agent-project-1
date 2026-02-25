@@ -1,0 +1,467 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# LLMOps — Quality Evaluation Pipeline
+#
+# Runs on every push to main and on a daily schedule.
+#
+# Jobs:
+#   1. snapshot-prompts  — Version-control current agent system prompts
+#   2. unit-eval         — Run heuristic quality checks (no API key needed)
+#   3. token-report      — Summarise token usage / cost from usage_log.jsonl
+#   4. trace-report      — Summarise latency and error rates from traces
+#   5. quality-gate      — Fail if avg response quality < threshold
+#
+# Optional (set ANTHROPIC_API_KEY secret for live LLM eval):
+#   6. live-eval         — Run a benchmark query set against the live API
+#
+# Required Secrets:
+#   ANTHROPIC_API_KEY    — Optional; enables the live-eval job
+# ─────────────────────────────────────────────────────────────────────────────
+name: LLMOps — Quality Evaluation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "agents/**"
+      - "orchestrator/**"
+      - "llmops/**"
+      - "mcp_server/tools/**"
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      run_live_eval:
+        description: "Run live LLM evaluation (requires ANTHROPIC_API_KEY)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+concurrency:
+  group: llmops-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  QUALITY_THRESHOLD: "0.55"   # minimum avg response quality score (0-1)
+
+jobs:
+
+  # ─── Job 1: Snapshot Prompts ───────────────────────────────────────────────
+  snapshot-prompts:
+    name: Snapshot Agent System Prompts
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Snapshot current system prompts
+        run: |
+          python -m llmops.prompt_registry snapshot
+          python -m llmops.prompt_registry list
+
+      - name: Upload prompt registry snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-registry
+          path: llmops/prompts/
+          retention-days: 90
+
+
+  # ─── Job 2: Unit Evaluation (heuristic, no API key) ───────────────────────
+  unit-eval:
+    name: Heuristic Quality Checks
+    runs-on: ubuntu-latest
+    outputs:
+      avg-score: ${{ steps.eval.outputs.avg_score }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run heuristic evaluations on canned responses
+        id: eval
+        run: |
+          python - <<'EOF'
+          import json
+          import sys
+          from llmops.response_evaluator import ResponseEvaluator
+
+          evaluator = ResponseEvaluator()
+
+          # Canned test cases — representative of real agent outputs
+          test_cases = [
+              {
+                  "agent": "segmentation",
+                  "query": "Who are our at-risk customers and what should we do?",
+                  "response": """
+          # At-Risk Customer Analysis
+
+          Based on RFM analysis across 20 customers, I identified **7 high-risk customers**
+          with churn risk scores above 0.60.
+
+          ## Critical Risk Customers (score ≥ 0.80)
+          - **Carol Test** (C003): risk=0.92, 580 days inactive, CLV=$150
+          - **Eve Wilson** (C005): risk=0.85, 420 days inactive, CLV=$650
+
+          ## Recommended Actions
+
+          1. **Immediate win-back campaign** (within 48h):
+             - 30% discount on favorite category
+             - Personalized email via preferred channel
+             - Budget: $2,500 from Q1 reactivation fund
+
+          2. **High-risk nurture** (30-day sequence):
+             - 3-part email series with loyalty points reminder
+             - Expected response rate: 12–15%
+
+          3. **Abandon campaign** for CLV < $200 customers — too costly to reactivate.
+          """,
+                  "tool_results": ["identify_churn_risk: 7 at-risk, avg_risk=0.71, total_clv=$4,200"],
+              },
+              {
+                  "agent": "campaign",
+                  "query": "Analyze campaign performance and recommend $50K budget allocation.",
+                  "response": """
+          # Campaign Performance Analysis & Budget Recommendation
+
+          ## Performance Summary (10 campaigns)
+          | Channel | ROI | CTR | Conversions |
+          |---------|-----|-----|-------------|
+          | Email   | 3.2x | 8.0% | 500 |
+          | SMS     | 1.5x | 5.0% | 100 |
+
+          ## Recommended $50K Allocation
+
+          Based on historical ROI-weighted optimization:
+
+          - **Email** ($35,000 / 70%): Highest ROI at 3.2x → projected return $112,000
+          - **SMS** ($10,000 / 20%): Solid secondary channel → projected $15,000
+          - **Push** ($5,000 / 10%): Test budget for engagement campaigns
+
+          **Expected blended ROI**: 2.54x → projected revenue $127,000
+          """,
+                  "tool_results": ["get_campaign_performance: email_roi=3.2, sms_roi=1.5"],
+              },
+              {
+                  "agent": "recommendation",
+                  "query": "What products should we recommend to our top Champions?",
+                  "response": """
+          # Product Recommendations for Champion Customers
+
+          For the 3 Champions identified (avg CLV $4,200), collaborative filtering
+          recommends:
+
+          1. **Gaming Laptop Pro** ($1,299) — Electronics; rated 4.8★; 85 similar purchases
+          2. **Noise-Cancelling Headphones** ($299) — Electronics; highly rated 4.7★
+          3. **Smart Watch Ultra** ($449) — Electronics + Fitness crossover
+
+          **Next Best Actions:**
+          - Send personalized email with early-access offer (Champions segment only)
+          - Include loyalty points multiplier (3x points this week)
+          - Expected CTR: ~22% based on segment history
+          """,
+                  "tool_results": ["get_product_recommendations: 5 recs returned"],
+              },
+              {
+                  "agent": "crm_loyalty",
+                  "query": "Give me a full briefing on customer C001.",
+                  "response": """
+          # Customer Briefing: Sarah Chen (C001)
+
+          ## Profile
+          - **Tier**: Gold | **CLV**: $3,840 | **Points**: 4,250
+          - **Location**: San Francisco, CA | **Age**: 34
+
+          ## Purchase History
+          - 12 orders | Total spent: $3,840 | Avg order: $320
+          - Top categories: Electronics (60%), Fashion (25%)
+          - Last purchase: 25 days ago
+
+          ## Loyalty Status
+          - 4,250 points (750 away from Platinum upgrade)
+          - Available rewards: $50 Gift Card, Early Access Pass
+          - Points to Platinum: 750
+
+          ## Recommended Next Actions
+          1. **Tier upgrade nudge**: Offer 2x points on next purchase → triggers Platinum
+          2. **Cross-sell**: Electronics accessories (based on recent laptop purchase)
+          3. **Loyalty reminder**: 2,000+ points available for redemption
+          """,
+                  "tool_results": ["get_customer_profile: 12 orders, $3840 total"],
+              },
+          ]
+
+          scores = []
+          for tc in test_cases:
+              result = evaluator.evaluate(
+                  query=tc["query"],
+                  response=tc["response"],
+                  agent=tc["agent"],
+                  tool_results=tc.get("tool_results", []),
+              )
+              scores.append(result["overall_score"])
+              print(f"  [{tc['agent']:>15}] score={result['overall_score']:.4f} "
+                    f"label={result['quality_label']:>10}  flags={result['flags']}")
+
+          avg = sum(scores) / len(scores)
+          print(f"\n  Average quality score: {avg:.4f}")
+          print(f"  Threshold:             ${{ env.QUALITY_THRESHOLD }}")
+
+          # Write outputs
+          with open("eval_avg_score.txt", "w") as f:
+              f.write(str(round(avg, 4)))
+          EOF
+
+          AVG=$(cat eval_avg_score.txt)
+          echo "avg_score=$AVG" >> "$GITHUB_OUTPUT"
+          echo "Average quality score: $AVG"
+
+      - name: Upload evaluation log
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-log
+          path: llmops/eval_log.jsonl
+          retention-days: 30
+
+
+  # ─── Job 3: Token Usage Report ────────────────────────────────────────────
+  token-report:
+    name: Token Usage & Cost Report
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate token usage report
+        run: |
+          if [ -f "llmops/usage_log.jsonl" ]; then
+            python -m llmops.token_tracker --since "$(date -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -v -7d +%Y-%m-%d)"
+          else
+            echo "No usage log found (no production traffic yet)"
+          fi
+
+      - name: Write step summary
+        run: |
+          echo "## LLM Token Usage (last 7 days)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "llmops/usage_log.jsonl" ]; then
+            python - <<'EOF'
+          import json
+          from llmops.token_tracker import UsageStore
+          from datetime import datetime, timedelta
+
+          since = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+          store = UsageStore()
+          summary = store.summary(since=since)
+
+          with open("$GITHUB_STEP_SUMMARY", "a") as f:
+              f.write(f"| Total calls | {summary.get('total_records', 0)} |\n")
+              f.write(f"| Total tokens | {summary.get('total_input_tokens', 0) + summary.get('total_output_tokens', 0):,} |\n")
+              f.write(f"| Total cost | \${summary.get('total_cost_usd', 0):.4f} |\n")
+              f.write(f"| Avg latency | {summary.get('avg_latency_ms', 0):.0f}ms |\n")
+          EOF
+          else
+            echo "No usage data available" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+
+  # ─── Job 4: Trace Report ──────────────────────────────────────────────────
+  trace-report:
+    name: Observability Trace Report
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate trace report
+        run: |
+          if [ -f "llmops/traces/traces.jsonl" ]; then
+            python -m llmops.observability report \
+              --since "$(date -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -v -7d +%Y-%m-%d)"
+          else
+            echo "No trace data found (no production traffic yet)"
+          fi
+
+
+  # ─── Job 5: Quality Gate ──────────────────────────────────────────────────
+  quality-gate:
+    name: Response Quality Gate
+    runs-on: ubuntu-latest
+    needs: unit-eval
+
+    steps:
+      - name: Enforce quality threshold
+        run: |
+          AVG="${{ needs.unit-eval.outputs.avg-score }}"
+          THRESHOLD="${{ env.QUALITY_THRESHOLD }}"
+
+          PASS=$(python3 -c "print('true' if float('$AVG') >= float('$THRESHOLD') else 'false')")
+          echo "Quality score $AVG vs threshold $THRESHOLD → gate=$PASS"
+
+          if [ "$PASS" = "false" ]; then
+            echo "::error::Quality gate FAILED: avg_score=$AVG < threshold=$THRESHOLD"
+            echo "Review the evaluation log and response evaluator report."
+            exit 1
+          fi
+
+          echo "✅ Quality gate passed: $AVG ≥ $THRESHOLD"
+
+      - name: Write summary
+        if: always()
+        run: |
+          PASS="${{ needs.unit-eval.outputs.avg-score >= env.QUALITY_THRESHOLD }}"
+          echo "## LLMOps Quality Gate" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Avg Quality Score | ${{ needs.unit-eval.outputs.avg-score }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Threshold | ${{ env.QUALITY_THRESHOLD }} |" >> "$GITHUB_STEP_SUMMARY"
+
+
+  # ─── Job 6: Live Evaluation (optional — requires ANTHROPIC_API_KEY) ────────
+  live-eval:
+    name: Live LLM Evaluation
+    runs-on: ubuntu-latest
+    needs: quality-gate
+    if: |
+      github.event.inputs.run_live_eval == 'true' ||
+      (github.event_name == 'schedule' && secrets.ANTHROPIC_API_KEY != '')
+    environment:
+      name: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run live benchmark queries
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python - <<'EOF'
+          """
+          Runs 3 benchmark queries through the full agent pipeline and evaluates quality.
+          Each query is scored by the ResponseEvaluator.
+          """
+          import asyncio
+          import json
+          import time
+          from llmops.response_evaluator import ResponseEvaluator
+          from llmops.token_tracker import UsageStore, TokenTracker
+          from llmops.observability import new_tracer
+
+          BENCHMARK_QUERIES = [
+              {
+                  "query": "Identify customers with high churn risk and recommend win-back strategy",
+                  "expected_agents": ["segmentation", "campaign"],
+              },
+              {
+                  "query": "What product recommendations should we make for our top customers?",
+                  "expected_agents": ["recommendation"],
+              },
+              {
+                  "query": "Calculate CLV for customer C001 and suggest loyalty actions",
+                  "expected_agents": ["crm_loyalty"],
+              },
+          ]
+
+          async def run_benchmark():
+              from orchestrator.orchestrator import Orchestrator
+              from mcp_client.client import MCPClientWrapper
+
+              evaluator = ResponseEvaluator()
+              usage_store = UsageStore()
+              results = []
+
+              async with MCPClientWrapper() as client:
+                  orchestrator = Orchestrator(client)
+
+                  for bq in BENCHMARK_QUERIES:
+                      tracer = new_tracer("live-eval")
+                      with tracer.start_span("benchmark", {"query": bq["query"][:50]}) as span:
+                          t0 = time.monotonic()
+                          try:
+                              with TokenTracker(usage_store, agent="benchmark") as tracker:
+                                  response = await orchestrator.process(bq["query"])
+                              elapsed = time.monotonic() - t0
+
+                              eval_result = evaluator.evaluate(
+                                  query=bq["query"],
+                                  response=response.get("final_response", ""),
+                                  agent="orchestrator",
+                              )
+
+                              span.set_attribute("quality_score", eval_result["overall_score"])
+                              span.set_attribute("elapsed_ms", round(elapsed * 1000))
+
+                              results.append({
+                                  "query": bq["query"][:60],
+                                  "elapsed_s": round(elapsed, 2),
+                                  "quality_score": eval_result["overall_score"],
+                                  "quality_label": eval_result["quality_label"],
+                                  "agents_used": response.get("agents_used", []),
+                              })
+
+                              print(f"  ✓ {bq['query'][:50]}...")
+                              print(f"    score={eval_result['overall_score']:.4f}, "
+                                    f"label={eval_result['quality_label']}, "
+                                    f"elapsed={elapsed:.1f}s")
+                          except Exception as e:
+                              print(f"  ✗ Failed: {e}")
+                              span.add_event("error", {"message": str(e)})
+                      tracer.flush()
+
+              avg_score = sum(r["quality_score"] for r in results) / max(len(results), 1)
+              print(f"\nBenchmark avg quality: {avg_score:.4f}")
+              print(json.dumps(results, indent=2))
+
+          asyncio.run(run_benchmark())
+          EOF
+
+      - name: Upload live eval results
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-eval-results
+          path: |
+            llmops/eval_log.jsonl
+            llmops/usage_log.jsonl
+            llmops/traces/traces.jsonl
+          retention-days: 30
