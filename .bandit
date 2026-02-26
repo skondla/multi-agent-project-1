@@ -1,0 +1,34 @@
+[bandit]
+# ─────────────────────────────────────────────────────────────────────────────
+# Bandit Configuration — Customer Intelligence Platform
+# Reference: https://bandit.readthedocs.io/en/latest/config.html
+#
+# Skipped test IDs (project-specific accepted risks):
+#   B101 — assert_used: tests legitimately use assert; not a security issue
+#   B404 — import_subprocess: intentional; security/ wrappers use subprocess safely
+#   B603 — subprocess_without_shell_equals_true: we always pass list args (safe)
+#   B607 — start_process_with_partial_path: trivy/bandit/pip-audit on PATH is intentional
+# ─────────────────────────────────────────────────────────────────────────────
+
+skips = B101,B404,B603,B607
+
+# Minimum severity and confidence levels to report (LOW = report everything)
+severity = LOW
+confidence = LOW
+
+# Directories to exclude from scanning
+exclude_dirs = [
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".git",
+    "data",
+    "tests",
+    ".pytest_cache",
+    "build",
+    "dist",
+    "llmops/traces",
+    "mlops/artifacts",
+    "mlops/outputs",
+]

@@ -1,0 +1,544 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Security Scan Workflow — Customer Intelligence Platform
+#
+# Runs static application security testing (SAST), dependency CVE scanning,
+# OWASP LLM Top 10 AI-specific checks, filesystem scanning, and container
+# image scanning on every push, PR, and nightly schedule.
+#
+# Jobs:
+#   1. sast              — Bandit Python SAST → SARIF → GitHub Security tab
+#   2. dependency-audit  — pip-audit dependency CVE check → artifact + summary
+#   3. owasp-ai          — OWASP LLM Top 10 heuristic checks → artifact + summary
+#   4. trivy-fs          — Trivy filesystem scan (no Docker build) → SARIF
+#   5. trivy-image       — Build image + full Trivy container scan → SARIF
+#   6. security-gate     — Aggregate all results; fail if thresholds exceeded
+#
+# Required Secrets:  none (all tools are public)
+# Optional Secrets:
+#   SLACK_WEBHOOK_URL    — Notify Slack on gate failure
+#
+# Severity Thresholds (workflow_dispatch inputs or env defaults):
+#   CRITICAL_THRESHOLD=0    (any CRITICAL finding fails the gate)
+#   HIGH_THRESHOLD=5        (more than 5 HIGH findings fails the gate)
+# ─────────────────────────────────────────────────────────────────────────────
+name: Security Scan
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  schedule:
+    - cron: "0 3 * * *"   # Nightly at 03:00 UTC — catches new CVE publications
+  workflow_dispatch:
+    inputs:
+      critical_threshold:
+        description: "Max CRITICAL findings before gate fails (default: 0)"
+        required: false
+        default: "0"
+        type: string
+      high_threshold:
+        description: "Max HIGH findings before gate fails (default: 5)"
+        required: false
+        default: "5"
+        type: string
+      run_image_scan:
+        description: "Run container image scan (requires Docker build)"
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+
+# Cancel in-progress runs on PR updates; never cancel on main (preserve security results)
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.11"
+  CRITICAL_THRESHOLD: ${{ github.event.inputs.critical_threshold || '0' }}
+  HIGH_THRESHOLD: ${{ github.event.inputs.high_threshold || '5' }}
+  IMAGE_TAG: customer-intelligence:${{ github.sha }}
+
+jobs:
+
+  # ─── Job 1: SAST — Bandit ─────────────────────────────────────────────────
+  sast:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # Required to upload SARIF to Security tab
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Bandit
+        run: pip install "bandit[sarif]>=1.7.9"
+
+      - name: Run Bandit SAST (JSON output for gate)
+        run: |
+          bandit \
+            -r . \
+            -f json \
+            --confidence-level LOW \
+            --severity-level LOW \
+            --exclude .venv,__pycache__,tests,data \
+            -o bandit-results.json \
+            || true
+
+      - name: Run Bandit SAST (SARIF for GitHub Security tab)
+        run: |
+          bandit \
+            -r . \
+            -f sarif \
+            --confidence-level LOW \
+            --severity-level LOW \
+            --exclude .venv,__pycache__,tests,data \
+            -o bandit-results.sarif \
+            || true
+
+      - name: Upload SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bandit-results.sarif
+          category: bandit-sast
+
+      - name: Upload Bandit JSON artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-results-${{ github.sha }}
+          path: bandit-results.json
+          retention-days: 30
+
+      - name: Write step summary
+        if: always()
+        run: |
+          echo "## Bandit SAST Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("bandit-results.json") as f:
+              data = json.load(f)
+            metrics = data.get("metrics", {}).get("_totals", {})
+            results = data.get("results", [])
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write("| Severity | Count |\n|----------|-------|\n")
+              for sev in ["HIGH", "MEDIUM", "LOW"]:
+                out.write(f"| {sev} | {int(metrics.get(f'SEVERITY.{sev}', 0))} |\n")
+              out.write(f"\nTotal issues: **{len(results)}**\n\n")
+          except Exception as e:
+            print(f"Summary error: {e}", file=sys.stderr)
+          PYEOF
+
+
+  # ─── Job 2: Dependency CVE Audit — pip-audit ──────────────────────────────
+  dependency-audit:
+    name: Dependency Audit (pip-audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run pip-audit via official action
+        uses: pypa/gh-action-pip-audit@v1.1.0
+        with:
+          inputs: requirements.txt
+        continue-on-error: true
+
+      - name: Install pip-audit for JSON artifact
+        run: pip install "pip-audit>=2.7.0"
+
+      - name: Run pip-audit (JSON output for gate)
+        run: |
+          pip-audit \
+            --requirement requirements.txt \
+            --format json \
+            --progress-spinner off \
+            --output pip-audit-results.json \
+            || true
+
+      - name: Upload pip-audit artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit-results-${{ github.sha }}
+          path: pip-audit-results.json
+          retention-days: 30
+
+      - name: Write step summary
+        if: always()
+        run: |
+          echo "## pip-audit Dependency CVE Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("pip-audit-results.json") as f:
+              data = json.load(f)
+            vulns = [
+              (d["name"], d["version"], v["id"])
+              for d in data.get("dependencies", [])
+              for v in d.get("vulns", [])
+            ]
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write(f"Total vulnerabilities: **{len(vulns)}**\n\n")
+              if vulns:
+                out.write("| Package | Version | ID |\n|---------|---------|----|\n")
+                for name, ver, vid in vulns[:20]:
+                  out.write(f"| {name} | {ver} | {vid} |\n")
+          except Exception as e:
+            print(f"Summary error: {e}", file=sys.stderr)
+          PYEOF
+
+
+  # ─── Job 3: OWASP LLM Top 10 AI Security Checks ──────────────────────────
+  owasp-ai:
+    name: OWASP AI Security (LLM Top 10)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install rich>=13.7.0 -r requirements.txt
+
+      - name: Run OWASP AI security scanner
+        continue-on-error: true
+        run: |
+          python -m security.owasp_ai_scanner \
+            --source . \
+            --summary-out owasp-ai-results.json \
+            --sarif-out owasp-ai-results.sarif
+
+      - name: Upload OWASP AI SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: owasp-ai-results.sarif
+          category: owasp-llm-top10
+        continue-on-error: true
+
+      - name: Upload OWASP AI artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-ai-results-${{ github.sha }}
+          path: |
+            owasp-ai-results.json
+            owasp-ai-results.sarif
+          retention-days: 30
+
+      - name: Write step summary
+        if: always()
+        run: |
+          echo "## OWASP LLM Top 10 Security Checks" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("owasp-ai-results.json") as f:
+              data = json.load(f)
+            total = data.get("total_findings", 0)
+            counts = data.get("severity_counts", {})
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write("| Severity | Count |\n|----------|-------|\n")
+              for sev in ["HIGH", "MEDIUM", "LOW", "INFO"]:
+                out.write(f"| {sev} | {counts.get(sev, 0)} |\n")
+              out.write(f"\nTotal OWASP LLM findings: **{total}**\n\n")
+              # Show top risk categories
+              by_category = data.get("by_owasp_id", {})
+              if by_category:
+                out.write("| OWASP ID | Risk | Findings |\n|----------|------|----------|\n")
+                for oid, info in sorted(by_category.items()):
+                  out.write(f"| {oid} | {info.get('name','')} | {info.get('count',0)} |\n")
+              out.write("\n")
+          except Exception as e:
+            print(f"Summary error: {e}", file=sys.stderr)
+          PYEOF
+
+
+  # ─── Job 4: Trivy Filesystem Scan ─────────────────────────────────────────
+  trivy-fs:
+    name: Trivy Filesystem Scan
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          scanners: vuln,secret
+          exit-code: "0"
+        continue-on-error: true
+
+      - name: Run Trivy filesystem scan (JSON for gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy-fs-results.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          scanners: vuln,secret
+          exit-code: "0"
+        continue-on-error: true
+
+      - name: Upload Trivy FS SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-filesystem
+
+      - name: Upload Trivy FS artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-results-${{ github.sha }}
+          path: trivy-fs-results.json
+          retention-days: 30
+
+      - name: Write step summary
+        if: always()
+        run: |
+          echo "## Trivy Filesystem Scan Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("trivy-fs-results.json") as f:
+              data = json.load(f)
+            counts = {}
+            for result in data.get("Results", []):
+              for v in result.get("Vulnerabilities") or []:
+                s = v.get("Severity", "UNKNOWN")
+                counts[s] = counts.get(s, 0) + 1
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write("| Severity | Count |\n|----------|-------|\n")
+              for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]:
+                out.write(f"| {sev} | {counts.get(sev, 0)} |\n")
+              out.write("\n")
+          except Exception as e:
+            print(f"Summary error: {e}", file=sys.stderr)
+          PYEOF
+
+
+  # ─── Job 5: Trivy Container Image Scan ────────────────────────────────────
+  trivy-image:
+    name: Trivy Image Scan
+    runs-on: ubuntu-latest
+    # Only run when triggered manually with run_image_scan=true, on push to main,
+    # or on nightly schedule (not on every PR to save CI minutes)
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      github.event.inputs.run_image_scan == 'true'
+    permissions:
+      security-events: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (load into local daemon for Trivy)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true                 # Required: loads image into local Docker daemon
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy image scan (SARIF)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_TAG }}
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          scanners: vuln,secret
+          exit-code: "0"
+        continue-on-error: true
+
+      - name: Run Trivy image scan (JSON for gate)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_TAG }}
+          format: json
+          output: trivy-image-results.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          scanners: vuln,secret
+          exit-code: "0"
+        continue-on-error: true
+
+      - name: Upload Trivy Image SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-container-image
+
+      - name: Upload Trivy Image artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-results-${{ github.sha }}
+          path: trivy-image-results.json
+          retention-days: 30
+
+      - name: Write step summary
+        if: always()
+        run: |
+          echo "## Trivy Container Image Scan — \`${{ env.IMAGE_TAG }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("trivy-image-results.json") as f:
+              data = json.load(f)
+            counts = {}
+            for result in data.get("Results", []):
+              for v in result.get("Vulnerabilities") or []:
+                s = v.get("Severity", "UNKNOWN")
+                counts[s] = counts.get(s, 0) + 1
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write("| Severity | Count |\n|----------|-------|\n")
+              for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]:
+                out.write(f"| {sev} | {counts.get(sev, 0)} |\n")
+              out.write("\n")
+          except Exception as e:
+            print(f"Summary error: {e}", file=sys.stderr)
+          PYEOF
+
+
+  # ─── Job 6: Security Gate ─────────────────────────────────────────────────
+  security-gate:
+    name: Security Gate
+    runs-on: ubuntu-latest
+    needs: [sast, dependency-audit, owasp-ai, trivy-fs, trivy-image]
+    # Run gate even if upstream jobs failed or were skipped (trivy-image is conditional)
+    if: always()
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install security tools
+        run: |
+          pip install \
+            "bandit[sarif]>=1.7.9" \
+            "pip-audit>=2.7.0" \
+            "rich>=13.7.0" \
+            -r requirements.txt
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-results-${{ github.sha }}"
+          merge-multiple: true
+
+      - name: Run security gate evaluation
+        env:
+          CRITICAL_THRESHOLD: ${{ env.CRITICAL_THRESHOLD }}
+          HIGH_THRESHOLD: ${{ env.HIGH_THRESHOLD }}
+        run: |
+          python -m security.report \
+            --source . \
+            --requirements requirements.txt \
+            --sarif-out security-combined.sarif \
+            --critical-threshold "$CRITICAL_THRESHOLD" \
+            --high-threshold "$HIGH_THRESHOLD"
+
+      - name: Upload combined SARIF to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: security-combined.sarif
+          category: security-gate-combined
+
+      - name: Upload combined SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-combined-${{ github.sha }}
+          path: security-combined.sarif
+          retention-days: 90
+
+      - name: Notify Slack on gate failure
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"text\": \":rotating_light: *Security Gate FAILED* — Customer Intelligence Platform\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Branch\", \"value\": \"${{ github.ref_name }}\", \"short\": true},
+                  {\"title\": \"Commit\", \"value\": \"${{ github.sha }}\", \"short\": true},
+                  {\"title\": \"CRITICAL threshold\", \"value\": \"${{ env.CRITICAL_THRESHOLD }}\", \"short\": true},
+                  {\"title\": \"HIGH threshold\", \"value\": \"${{ env.HIGH_THRESHOLD }}\", \"short\": true},
+                  {\"title\": \"Workflow run\", \"value\": \"<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>\", \"short\": false}
+                ]
+              }]
+            }"

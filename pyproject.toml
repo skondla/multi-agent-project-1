@@ -26,6 +26,10 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
 ]
+security = [
+    "bandit[sarif]>=1.7.9",
+    "pip-audit>=2.7.0",
+]
 
 [project.scripts]
 cip = "main:main_sync"
@@ -36,4 +40,4 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mcp_server*", "mcp_client*", "agents*", "orchestrator*", "ui*"]
+include = ["mcp_server*", "mcp_client*", "agents*", "orchestrator*", "ui*", "security*"]

@@ -108,3 +108,114 @@ jobs:
 
       - name: Verify image was built
         run: docker image inspect customer-intelligence:${{ github.sha }} || echo "Image not found in local daemon (expected with buildx)"
+
+
+  # ─── Job 4: Security Scan (quick — Bandit + pip-audit) ────────────────────
+  security-scan:
+    name: Security Scan (Bandit + pip-audit + OWASP AI)
+    runs-on: ubuntu-latest
+    # Run independently; full image scan is in security-scan.yml workflow
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install security tools and project dependencies
+        run: pip install bandit[sarif]>=1.7.9 pip-audit>=2.7.0 rich>=13.7.0 -r requirements.txt
+
+      - name: Run Bandit SAST
+        # continue-on-error: gate is enforced in the dedicated security-scan.yml workflow
+        continue-on-error: true
+        run: |
+          bandit \
+            -r . \
+            -f json \
+            --confidence-level LOW \
+            --severity-level LOW \
+            --exclude .venv,__pycache__,tests,data \
+            -o bandit-results.json \
+            || true
+          echo "## Bandit SAST" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("bandit-results.json") as f:
+              data = json.load(f)
+            metrics = data.get("metrics", {}).get("_totals", {})
+            n = len(data.get("results", []))
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write(f"Total issues: **{n}** — ")
+              out.write(f"HIGH: {int(metrics.get('SEVERITY.HIGH', 0))}, ")
+              out.write(f"MEDIUM: {int(metrics.get('SEVERITY.MEDIUM', 0))}, ")
+              out.write(f"LOW: {int(metrics.get('SEVERITY.LOW', 0))}\n\n")
+          except Exception as e:
+            print(f"Could not summarise Bandit results: {e}", file=sys.stderr)
+          PYEOF
+
+      - name: Run pip-audit dependency scan
+        continue-on-error: true
+        run: |
+          pip-audit \
+            --requirement requirements.txt \
+            --format json \
+            --progress-spinner off \
+            --output pip-audit-results.json \
+            || true
+          echo "## pip-audit Dependency CVEs" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("pip-audit-results.json") as f:
+              data = json.load(f)
+            vulns = sum(len(d.get("vulns", [])) for d in data.get("dependencies", []))
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write(f"Total CVEs found: **{vulns}**\n\n")
+          except Exception as e:
+            print(f"Could not summarise pip-audit results: {e}", file=sys.stderr)
+          PYEOF
+
+      - name: Run OWASP AI security checks
+        continue-on-error: true
+        run: |
+          echo "## OWASP LLM Top 10 Checks" >> "$GITHUB_STEP_SUMMARY"
+          python3 -m security.owasp_ai_scanner \
+            --source . \
+            --summary-out owasp-ai-results.json \
+            || true
+          python3 - <<'PYEOF'
+          import json, os, sys
+          try:
+            with open("owasp-ai-results.json") as f:
+              data = json.load(f)
+            total = data.get("total_findings", 0)
+            counts = data.get("severity_counts", {})
+            sfile = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+            with open(sfile, "a") as out:
+              out.write(f"Total findings: **{total}** — ")
+              out.write(f"HIGH: {counts.get('HIGH', 0)}, ")
+              out.write(f"MEDIUM: {counts.get('MEDIUM', 0)}, ")
+              out.write(f"LOW: {counts.get('LOW', 0)}\n\n")
+          except Exception as e:
+            print(f"Could not summarise OWASP AI results: {e}", file=sys.stderr)
+          PYEOF
+
+      - name: Upload security scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-security-results-${{ github.sha }}
+          path: |
+            bandit-results.json
+            pip-audit-results.json
+            owasp-ai-results.json
+          retention-days: 7
