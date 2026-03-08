@@ -4,14 +4,17 @@ A production-quality **multi-agent AI application** demonstrating orchestrated A
 
 ## Architecture
 
+![Architecture](agent_orchestration_architecture.png)
+
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                    main.py (Rich CLI)                            │
+│                    main.py (Rich CLI)                           │
 └──────────────────────────┬──────────────────────────────────────┘
                            │
-┌──────────────────────────▼──────────────────────────────────────┐
+┌──────────────────────────▼──────────────────────────────────────-┐
 │              Orchestrator (Claude Routing + Synthesis)           │
-│  Phase 1: Route → Phase 2: Execute → Phase 3: Synthesize        │
+│  Phase 1: Route → Phase 2: Execute → Phase 3: Synthesize         │
 └────┬─────────┬──────────┬────────────────────────────────────────┘
      │         │          │           │
      ▼         ▼          ▼           ▼
